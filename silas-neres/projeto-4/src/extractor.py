@@ -4,8 +4,10 @@ Detecta o tipo de documento (boletim conjuntura vs prévia individual)
 pelo conteúdo do texto e usa o schema Pydantic correto para cada caso.
 """
 import logging
+import time
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError
 
 from src.config import GEMINI_API_KEY, GEMINI_MODEL
 from src.schemas import DadosOperacionaisLLM, BoletimConjunturaLLM
@@ -13,6 +15,8 @@ from src.schemas import DadosOperacionaisLLM, BoletimConjunturaLLM
 logger = logging.getLogger(__name__)
 
 _client = None
+_MAX_RETRIES = 4
+_RETRY_DELAYS = [10, 20, 40, 60]  # backoff em segundos
 
 KEYWORDS_BOLETIM = [
     "conjuntura do setor",
@@ -27,6 +31,25 @@ def _get_client() -> genai.Client:
     if _client is None:
         _client = genai.Client(api_key=GEMINI_API_KEY)
     return _client
+
+
+def _call_with_retry(model: str, contents: str, config) -> object:
+    """Chama o Gemini com retry exponencial em caso de 503/429."""
+    client = _get_client()
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:
+            is_retryable = "503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)
+            if is_retryable and attempt < _MAX_RETRIES:
+                logger.warning(f"Gemini {e.__class__.__name__} (tentativa {attempt}/{_MAX_RETRIES}). Aguardando {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+    # Última tentativa sem captura
+    return client.models.generate_content(model=model, contents=contents, config=config)
 
 
 def detect_document_type(text: str) -> str:
@@ -59,10 +82,9 @@ TEXTO DO DOCUMENTO:
 
 
 def extract_boletim(pdf_text: str) -> BoletimConjunturaLLM:
-    client = _get_client()
     prompt = PROMPT_BOLETIM.format(text=pdf_text)
 
-    response = client.models.generate_content(
+    response = _call_with_retry(
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -106,10 +128,9 @@ TEXTO DO DOCUMENTO:
 
 
 def extract_previa(pdf_text: str, empresa: str) -> DadosOperacionaisLLM:
-    client = _get_client()
     prompt = PROMPT_PREVIA.format(text=pdf_text, empresa=empresa)
 
-    response = client.models.generate_content(
+    response = _call_with_retry(
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -124,7 +145,72 @@ def extract_previa(pdf_text: str, empresa: str) -> DadosOperacionaisLLM:
         raise ValueError(f"Gemini retornou resposta vazia para {empresa}")
 
     logger.info(
-        f"[Prévia] {dados.empresa} {dados.trimestre}T{dados.ano} | "
+        f"[Prévia/texto] {dados.empresa} {dados.trimestre}T{dados.ano} | "
+        f"Vendas: {dados.vendas_liquidas_unidades} un."
+    )
+    return dados
+
+
+PROMPT_PREVIA_IMAGEM = """Você é um analista de dados especializado em relatórios trimestrais de incorporadoras imobiliárias.
+
+Este PDF é uma APRESENTAÇÃO/SLIDESHOW. Os dados estão em tabelas e gráficos visuais nas imagens abaixo.
+
+REGRAS CRÍTICAS:
+1. Leia TODAS as imagens e localize as tabelas com dados operacionais.
+2. Extraia SOMENTE valores ABSOLUTOS: unidades, R$ mil ou R$ milhões. NUNCA confunda % de variação com valor absoluto.
+3. VALORES MONETÁRIOS: sempre em R$ MIL. Se estiver em R$ milhões, multiplique por 1.000.
+4. TRIMESTRE: retorne apenas o número inteiro (1, 2, 3 ou 4). "1T26" = trimestre 1, ano 2026.
+5. VENDAS LÍQUIDAS = vendas brutas MENOS distratos/cancelamentos.
+6. VSO: retorne apenas o número (ex: 15.3 para 15,3%).
+7. Se um valor não estiver visível nas imagens, retorne null. NUNCA invente.
+8. Priorize dados DO TRIMESTRE, não acumulados do ano.
+
+Empresa monitorada: {empresa}
+
+Analise as páginas do PDF abaixo e extraia os dados operacionais:
+"""
+
+
+def extract_previa_from_images(page_images: list[bytes], empresa: str) -> DadosOperacionaisLLM:
+    """
+    Extração via Gemini Vision — para PDFs de apresentação onde os dados
+    estão em tabelas gráficas não capturáveis por extração de texto.
+    """
+    client = _get_client()
+
+    # Monta conteúdo multimodal: imagens + instrução
+    contents = []
+    for img_bytes in page_images:
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+    contents.append(PROMPT_PREVIA_IMAGEM.format(empresa=empresa))
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=DadosOperacionaisLLM,
+        temperature=0.0,
+    )
+
+    # Retry manual para multimodal (não usa _call_with_retry pois contents é lista)
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=contents, config=config
+            )
+            break
+        except Exception as e:
+            is_retryable = "503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)
+            if is_retryable and attempt < _MAX_RETRIES:
+                logger.warning(f"Gemini Vision retry {attempt}/{_MAX_RETRIES} em {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+
+    dados = response.parsed
+    if dados is None:
+        raise ValueError(f"Gemini Vision retornou resposta vazia para {empresa}")
+
+    logger.info(
+        f"[Prévia/vision] {dados.empresa} {dados.trimestre}T{dados.ano} | "
         f"Vendas: {dados.vendas_liquidas_unidades} un."
     )
     return dados

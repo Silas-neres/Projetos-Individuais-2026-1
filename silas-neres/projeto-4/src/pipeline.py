@@ -10,8 +10,8 @@ from src.database import (
     BoletimConjuntura, BoletimTotal, BoletimEmpresa
 )
 from src.scraper import scrape_all_companies, download_pdf
-from src.pdf_parser import extract_text_from_bytes
-from src.extractor import detect_document_type, extract_boletim, extract_previa
+from src.pdf_parser import extract_text_from_bytes, extract_pages_as_images, is_visual_pdf
+from src.extractor import detect_document_type, extract_boletim, extract_previa, extract_previa_from_images
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,11 @@ def process_pdf(url: str, empresa: str, nome_arquivo: str = "") -> dict:
         try:
             if doc_type == "boletim_conjuntura":
                 result = _process_boletim(db, pdf_text, url, hash_sha256, nome_arquivo, catalog_entry)
+            elif is_visual_pdf(pdf_text):
+                # PDF de slideshow — tabelas estão em imagens, usa Gemini Vision
+                logger.info(f"[{empresa}] PDF visual detectado. Usando extração por imagem (Vision).")
+                page_images = extract_pages_as_images(pdf_bytes)
+                result = _process_previa_vision(db, page_images, empresa, url, hash_sha256, nome_arquivo, catalog_entry)
             else:
                 result = _process_previa(db, pdf_text, empresa, url, hash_sha256, nome_arquivo, catalog_entry)
         except Exception as e:
@@ -154,6 +159,45 @@ def _process_boletim(db, pdf_text, url, hash_sha256, nome_arquivo, catalog_entry
         "ano": dados.ano,
         "trimestre": dados.trimestre,
         "empresas": [e.empresa for e in dados.empresas],
+        "hash": hash_sha256,
+    }
+
+
+def _process_previa_vision(db, page_images, empresa, url, hash_sha256, nome_arquivo, catalog_entry) -> dict:
+    """Extração via Gemini Vision para PDFs de apresentação (slides com tabelas visuais)."""
+    dados = extract_previa_from_images(page_images, empresa)
+
+    existing = db.query(DadosOperacionais).filter_by(
+        empresa=dados.empresa, ano=dados.ano, trimestre=dados.trimestre
+    ).first()
+
+    if existing:
+        _update_dado(existing, dados, url, hash_sha256, nome_arquivo, catalog_entry.id)
+    else:
+        db.add(DadosOperacionais(
+            empresa=dados.empresa, ano=dados.ano, trimestre=dados.trimestre,
+            lancamentos_unidades=dados.lancamentos_unidades,
+            lancamentos_vgv_mil=dados.lancamentos_vgv_mil,
+            vendas_liquidas_unidades=dados.vendas_liquidas_unidades,
+            vendas_liquidas_vgv_mil=dados.vendas_liquidas_vgv_mil,
+            estoque_unidades=dados.estoque_unidades,
+            estoque_vgv_mil=dados.estoque_vgv_mil,
+            entregas_unidades=dados.entregas_unidades,
+            vso_percentual=dados.vso_percentual,
+            unidades_em_obras=dados.unidades_em_obras,
+            url_origem=url, hash_pdf=hash_sha256,
+            data_coleta=datetime.utcnow(),
+            nome_arquivo=nome_arquivo,
+            pdf_catalog_id=catalog_entry.id,
+        ))
+
+    return {
+        "status": "sucesso",
+        "tipo": "previa_operacional",
+        "metodo_extracao": "vision",
+        "empresa": dados.empresa,
+        "ano": dados.ano,
+        "trimestre": dados.trimestre,
         "hash": hash_sha256,
     }
 
